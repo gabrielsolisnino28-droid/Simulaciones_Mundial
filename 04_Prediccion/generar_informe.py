@@ -113,13 +113,29 @@ for nombre, r in mc.iterrows():
 L.append("")
 
 L.append("## Validación con los partidos ya jugados\n")
-L.append("| Partido | Predicción del modelo | Resultado real |")
-L.append("|---|:-:|:-:|")
-pred_mex = grupos[(grupos['Local'] == 'México') & (grupos['Visitante'] == 'Sudáfrica')].iloc[0]
-pred_kor = grupos[(grupos['Local'] == 'Corea del Sur') & (grupos['Visitante'] == 'República Checa')].iloc[0]
-L.append(f"| 🇲🇽 México – 🇿🇦 Sudáfrica | {pred_mex['Marcador_Predicho']} (P1 {pred_mex['Prob_1']:.0f}%) | 2-0 ✅ ganador acertado |")
-L.append(f"| 🇰🇷 Corea del Sur – 🇨🇿 República Checa | {pred_kor['Marcador_Predicho']} (P1 {pred_kor['Prob_1']:.0f}%) | 2-1 ✅ ganador acertado |")
-L.append("")
+jugados = grupos[grupos['Marcador_Real'].notna() & (grupos['Marcador_Real'].astype(str) != '')].copy() \
+    if 'Marcador_Real' in grupos.columns else grupos.iloc[0:0]
+if len(jugados):
+    aciertos = 0
+    L.append("| Partido | Predicción (1X2 máx) | Resultado real | ¿Acierto? |")
+    L.append("|---|:-:|:-:|:-:|")
+    for _, r in jugados.iterrows():
+        gl, gv = (int(x) for x in str(r['Marcador_Real']).split('-'))
+        real = '1' if gl > gv else ('X' if gl == gv else '2')
+        probs = {'1': r['Prob_1'], 'X': r['Prob_X'], '2': r['Prob_2']}
+        pred = max(probs, key=probs.get)
+        ok = real == pred
+        aciertos += ok
+        nombre_pred = {'1': r['Local'], '2': r['Visitante'], 'X': 'Empate'}[pred]
+        L.append(f"| {eq(r['Local'])} – {eq(r['Visitante'])} | {nombre_pred} ({probs[pred]:.0f}%) | "
+                 f"{r['Marcador_Real']} | {'✅' if ok else '❌'} |")
+    L.append("")
+    L.append(f"**Aciertos de ganador: {aciertos}/{len(jugados)} "
+             f"({aciertos / len(jugados) * 100:.0f}%).** Las probabilidades de campeón y de clasificación "
+             "de arriba ya están *condicionadas* a estos resultados: los partidos jugados se fijan y solo "
+             "se simulan los que faltan.\n")
+else:
+    L.append("_Aún no hay partidos jugados registrados en el calendario oficial._\n")
 L.append("---\n*Predicciones generadas automáticamente con `prediccion_mundial.py`. "
          "El fútbol, por suerte, no entiende de modelos.* ⚽")
 

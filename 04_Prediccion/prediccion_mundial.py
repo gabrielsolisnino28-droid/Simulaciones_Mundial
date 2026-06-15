@@ -297,9 +297,52 @@ def cargar_mundial():
     df_mundial_vars.columns = df_mundial_vars.columns.str.replace(r'_y$', '_Visitante', regex=True)
     df_mundial_grupos = pd.merge(df_mundial_vars, grupos, left_on='Equipo_Local', right_on='Equipo').drop('Equipo', axis=1)
 
-    # Las fechas reales de cada partido (el merge pisa la columna Fecha con la de df_vars)
+    # Las fechas reales de cada partido (el merge pisa la columna Fecha con la de df_vars).
+    # El scraping traía las fechas en hora europea (partidos nocturnos de América corridos
+    # un día); si está disponible el calendario oficial, usamos la fecha local del estadio.
     fechas_reales = pd.read_csv('./Data/partidos_mundial.csv')[['Fecha', 'Equipo_Local', 'Equipo_Visitante']]
+    try:
+        import calendario_oficial
+        oficiales = calendario_oficial.mapa_fechas_oficiales(refrescar=False)
+        fechas_reales['Fecha'] = fechas_reales.apply(
+            lambda r: oficiales.get((r['Equipo_Local'], r['Equipo_Visitante']), r['Fecha']), axis=1)
+    except Exception as e:
+        print(f'  (sin calendario oficial, se usan las fechas del scraping: {e})')
     return df_mundial_grupos, df_vars, grupos, fechas_reales
+
+
+def resultados_reales():
+    """{(local, visitante): (resultado 0/1/2, gl, gv)} de los partidos de grupos
+    ya jugados (en ambas orientaciones), tomados del calendario oficial. Es lo que
+    permite *condicionar* el pronóstico: fijar lo jugado y simular solo el resto."""
+    try:
+        import calendario_oficial
+        partidos = calendario_oficial.cargar_partidos_grupos(refrescar=False)
+    except Exception as e:
+        print(f'  (sin resultados reales disponibles: {e})')
+        return {}
+    res = {}
+    for p in partidos:
+        if p['gl'] is None or p['gv'] is None:
+            continue
+        gl, gv = int(p['gl']), int(p['gv'])
+        o = 0 if gl > gv else (1 if gl == gv else 2)
+        res[(p['local'], p['visitante'])] = (o, gl, gv)
+        res[(p['visitante'], p['local'])] = ({0: 2, 1: 1, 2: 0}[o], gv, gl)
+    return res
+
+
+def _alinear_resultados(df, reales):
+    """Arrays alineados a las filas de df: out (0/1/2 ó -1 si no jugado) y goles
+    L/V (xG-irrelevante: NaN si no jugado)."""
+    out = np.full(len(df), -1, dtype=np.int64)
+    gls = np.full(len(df), np.nan); gvs = np.full(len(df), np.nan)
+    for k, (_, r) in enumerate(df.iterrows()):
+        clave = (r['Equipo_Local'], r['Equipo_Visitante'])
+        if clave in reales:
+            o, gl, gv = reales[clave]
+            out[k] = o; gls[k] = gl; gvs[k] = gv
+    return out, gls, gvs
 
 
 # ====================================================================
@@ -396,7 +439,7 @@ def clasificar_grupos(df, tiradas):
 # 7. MONTE CARLO VECTORIZADO (10.000 mundiales)
 # ====================================================================
 
-def monte_carlo(df_pred_grupos, mc, equipos, n_sims=N_SIMULACIONES):
+def monte_carlo(df_pred_grupos, mc, equipos, n_sims=N_SIMULACIONES, reales=None):
     idx = mc['idx']
     n_eq = len(equipos)
     grupos_de = {}   # equipo -> grupo
@@ -414,10 +457,16 @@ def monte_carlo(df_pred_grupos, mc, equipos, n_sims=N_SIMULACIONES):
     P = P / P.sum(axis=1, keepdims=True)
     xg_l = df['xG_Modelo_Local'].to_numpy(); xg_v = df['xG_Modelo_Visitante'].to_numpy()
 
-    # GF/GC por equipo son constantes (el notebook usa los xG del modelo como goles)
+    # Condicionamiento: goles reales en los partidos jugados, xG del modelo en el resto
+    known_out, known_gl, known_gv = _alinear_resultados(df, reales or {})
+    jugado = known_out >= 0
+    g_loc = np.where(jugado, known_gl, xg_l)
+    g_vis = np.where(jugado, known_gv, xg_v)
+
+    # GF/GC por equipo (constantes entre simulaciones; reales donde ya se jugó)
     gf = np.zeros(n_eq); gc = np.zeros(n_eq)
-    np.add.at(gf, loc, xg_l); np.add.at(gf, vis, xg_v)
-    np.add.at(gc, loc, xg_v); np.add.at(gc, vis, xg_l)
+    np.add.at(gf, loc, g_loc); np.add.at(gf, vis, g_vis)
+    np.add.at(gc, loc, g_vis); np.add.at(gc, vis, g_loc)
     dg = gf - gc
     # Claves de desempate exactas en enteros (centésimas)
     dg_c = np.round(dg * 100).astype(np.int64)
@@ -427,6 +476,9 @@ def monte_carlo(df_pred_grupos, mc, equipos, n_sims=N_SIMULACIONES):
     u = np.random.random((n_sims, len(df)))
     cum1 = P[:, 0]; cum2 = P[:, 0] + P[:, 1]
     out = np.where(u < cum1, 0, np.where(u < cum2, 1, 2)).astype(np.int8)
+    # Fijamos el resultado real de los partidos ya disputados en todas las simulaciones
+    if jugado.any():
+        out[:, jugado] = known_out[jugado].astype(np.int8)
 
     pts = np.zeros((n_sims, n_eq), dtype=np.int64)
     for m in range(len(df)):
@@ -497,29 +549,39 @@ FASES_FECHAS = {
     'Semifinales': '14 - 15 jul', '3er Puesto': '18 jul', 'Final': '19 jul'
 }
 
-def prediccion_puntual(df_pred_grupos, mc, equipos, fechas_reales):
+def prediccion_puntual(df_pred_grupos, mc, equipos, fechas_reales, reales=None):
     idx = mc['idx']
+    df_pred_grupos = df_pred_grupos.reset_index(drop=True)
 
-    # --- Fase de grupos: resultado más probable de cada partido ---
+    # --- Fase de grupos: resultado real si ya se jugó, si no el más probable ---
     probs = df_pred_grupos[['Prob_Local', 'Prob_Empate', 'Prob_Visitante']].to_numpy()
     tiradas = probs.argmax(axis=1)
+    known_out, known_gl, known_gv = _alinear_resultados(df_pred_grupos, reales or {})
+    jugado = known_out >= 0
+    tiradas = np.where(jugado, known_out, tiradas)
 
     filas = []
     mapa_fechas = {(r['Equipo_Local'], r['Equipo_Visitante']): r['Fecha'] for _, r in fechas_reales.iterrows()}
     for k, (_, r) in enumerate(df_pred_grupos.iterrows()):
-        res = ['1', 'X', '2'][tiradas[k]]
+        res = ['1', 'X', '2'][int(probs[k].argmax())]
         gl, gv = marcador_mas_probable(r['xG_Modelo_Local'], r['xG_Modelo_Visitante'], res)
+        real = f"{int(known_gl[k])}-{int(known_gv[k])}" if jugado[k] else ''
         filas.append({
             'Fecha': mapa_fechas.get((r['Equipo_Local'], r['Equipo_Visitante']), ''),
             'Grupo': r['Grupo'], 'Local': r['Equipo_Local'], 'Visitante': r['Equipo_Visitante'],
-            'Marcador_Predicho': f"{gl}-{gv}", 'Resultado_1X2': res,
+            'Marcador_Predicho': f"{gl}-{gv}", 'Resultado_1X2': res, 'Marcador_Real': real,
             'xG_L': round(r['xG_Modelo_Local'], 2), 'xG_V': round(r['xG_Modelo_Visitante'], 2),
             'Prob_1': round(r['Prob_Local'] * 100, 1), 'Prob_X': round(r['Prob_Empate'] * 100, 1),
             'Prob_2': round(r['Prob_Visitante'] * 100, 1),
         })
     df_grupos_pred = pd.DataFrame(filas).sort_values(['Grupo', 'Fecha']).reset_index(drop=True)
 
-    clasif, terceros, pos = clasificar_grupos(df_pred_grupos, tiradas)
+    # Clasificación condicionada: goles reales donde ya se jugó
+    df_eff = df_pred_grupos.copy()
+    if jugado.any():
+        df_eff.loc[jugado, 'xG_Modelo_Local'] = known_gl[jugado]
+        df_eff.loc[jugado, 'xG_Modelo_Visitante'] = known_gv[jugado]
+    clasif, terceros, pos = clasificar_grupos(df_eff, tiradas)
 
     # --- Eliminatorias: avanza el más probable (con penaltis si el empate es lo más probable) ---
     P1, PX, P2, XGL, XGV = mc['P1'], mc['PX'], mc['P2'], mc['XGL'], mc['XGV']
@@ -580,12 +642,17 @@ if __name__ == '__main__':
     print("Calculando matriz de cruces 48x48 (T=%.2f)..." % T_CRUCES)
     mc = matriz_cruces(equipos, df_vars)
 
+    reales = resultados_reales()
+    n_jugados = len(reales) // 2
+    if n_jugados:
+        print(f"Condicionando el pronóstico con {n_jugados} partidos de grupos ya jugados.")
+
     print("Generando predicción puntual de los 104 partidos...")
     df_grupos_pred, clasif, terceros, pos, df_elim, campeon = prediccion_puntual(
-        df_predicciones_mundial, mc, equipos, fechas_reales)
+        df_predicciones_mundial, mc, equipos, fechas_reales, reales=reales)
 
     print(f"Simulando {N_SIMULACIONES} mundiales (Monte Carlo)...")
-    tabla_mc = monte_carlo(df_predicciones_mundial, mc, equipos, N_SIMULACIONES)
+    tabla_mc = monte_carlo(df_predicciones_mundial, mc, equipos, N_SIMULACIONES, reales=reales)
 
     # --- Guardado ---
     df_grupos_pred.to_csv('Predicciones/predicciones_fase_grupos.csv', index=False, encoding='utf-8-sig')

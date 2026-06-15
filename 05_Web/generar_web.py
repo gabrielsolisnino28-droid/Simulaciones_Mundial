@@ -7,9 +7,12 @@ Para cada partido de la fase de grupos calcula con el modelo del repo:
   - Córners esperados y P(más de 7.5 / 8.5 / 9.5)  [Poisson sobre medias por equipo]
   - Tarjetas amarillas esperadas y P(más de 3.5 / 4.5)
 
-La sección de partidos tiene un selector de jornadas que arranca en la fecha
-local del visitante, así la página se actualiza sola cada día. Un workflow de
-GitHub Actions la regenera a diario por si cambian los datos.
+Las fechas y horas vienen del calendario oficial (hora de inicio en UTC): el
+navegador agrupa los partidos según la zona horaria del visitante, así "hoy"
+es correcto en cualquier país. El feed oficial también trae los resultados
+reales de los partidos jugados, que se muestran junto a la predicción con el
+contador de aciertos del modelo. Un workflow de GitHub Actions regenera todo
+a diario.
 
 Uso:  python 05_Web/generar_web.py   (requiere los .pkl entrenados; si no
       existen, ejecuta antes 04_Prediccion/prediccion_mundial.py)
@@ -27,7 +30,8 @@ RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(RAIZ)
 sys.path.insert(0, os.path.join(RAIZ, '04_Prediccion'))
 
-import prediccion_mundial as pm  # noqa: E402  (reutilizamos el pipeline del repo)
+import prediccion_mundial as pm      # noqa: E402  (pipeline del repo)
+import calendario_oficial            # noqa: E402  (fechas/horas oficiales y resultados)
 
 # Códigos ISO para las banderas (flagcdn.com)
 BANDERAS_ISO = {
@@ -53,6 +57,14 @@ def p_poisson_mas_de(lam, linea):
 
 
 def construir_datos():
+    # Refresca el calendario oficial (horas UTC + resultados reales)
+    oficial = calendario_oficial.cargar_partidos_grupos(refrescar=True)
+    por_cruce = {}
+    for p in oficial:
+        por_cruce[(p['local'], p['visitante'])] = p
+        por_cruce.setdefault((p['visitante'], p['local']),
+                             {**p, 'gl': p['gv'], 'gv': p['gl'], '_invertido': True})
+
     df_mundial_grupos, df_vars, grupos, fechas_reales = pm.cargar_mundial()
 
     # Probabilidades calibradas sin temperatura: las adecuadas para mostrar
@@ -60,10 +72,9 @@ def construir_datos():
     pred['Grupo'] = df_mundial_grupos['Grupo'].values
 
     stats = df_vars.set_index('Equipo')
-    mapa_fechas = {(r['Equipo_Local'], r['Equipo_Visitante']): r['Fecha']
-                   for _, r in fechas_reales.iterrows()}
 
     partidos = []
+    sin_oficial = 0
     for _, r in pred.iterrows():
         a, b = r['Equipo_Local'], r['Equipo_Visitante']
         p1, px, p2 = r['Prob_Local'], r['Prob_Empate'], r['Prob_Visitante']
@@ -78,8 +89,14 @@ def construir_datos():
         lam_tar = (stats.loc[a, 'avg_Tarjetas_amarillas_5'] + stats.loc[b, 'avg_Tarjetas_amarillas_5'] +
                    stats.loc[a, 'avg_Tarjetas_amarillas_total'] + stats.loc[b, 'avg_Tarjetas_amarillas_total']) / 2
 
+        of = por_cruce.get((a, b))
+        if of is None:
+            sin_oficial += 1
         partidos.append({
-            'fecha': mapa_fechas.get((a, b), ''),
+            'fecha': of['fecha_oficial'] if of else '',
+            'utc': of['utc'] if of else None,
+            'ciudad': of['ciudad'] if of else '',
+            'rgl': of['gl'] if of else None, 'rgv': of['gv'] if of else None,
             'grupo': r['Grupo'], 'local': a, 'visitante': b,
             'marcador': f'{gl}-{gv}',
             'p1': round(p1 * 100, 1), 'px': round(px * 100, 1), 'p2': round(p2 * 100, 1),
@@ -90,7 +107,9 @@ def construir_datos():
             'tar': round(lam_tar, 1),
             't35': round(p_poisson_mas_de(lam_tar, 3.5) * 100), 't45': round(p_poisson_mas_de(lam_tar, 4.5) * 100),
         })
-    partidos.sort(key=lambda p: (p['fecha'], p['grupo']))
+    if sin_oficial:
+        print(f'  AVISO: {sin_oficial} partidos sin cruce en el calendario oficial')
+    partidos.sort(key=lambda p: (p['utc'] or p['fecha'], p['grupo']))
 
     mc = pd.read_csv('Predicciones/probabilidades_montecarlo.csv', index_col=0)
     campeon = [{'equipo': eq, 'r32': float(r['R32']), 'octavos': float(r['Octavos']),
@@ -122,9 +141,9 @@ PLANTILLA = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mundial 2026 · Predicciones diarias del modelo</title>
-<meta name="description" content="Probabilidades de ganar, córners, tarjetas y marcador predicho para cada partido del Mundial 2026, generadas con XGBoost y simulación de Monte Carlo.">
+<meta name="description" content="Probabilidades de ganar, córners, tarjetas y marcador predicho para cada partido del Mundial 2026, con resultados reales y aciertos del modelo actualizados a diario.">
 <meta property="og:title" content="Mundial 2026 · Predicciones diarias del modelo">
-<meta property="og:description" content="Probabilidades de victoria, córners y tarjetas de cada partido + cuadro completo hasta la final. XGBoost + 10.000 mundiales simulados.">
+<meta property="og:description" content="Probabilidades de victoria, córners y tarjetas de cada partido + resultados reales y cuadro completo hasta la final. XGBoost + 10.000 mundiales simulados.">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚽</text></svg>">
 <style>
@@ -136,7 +155,8 @@ body{background:var(--bg);color:var(--tx);font:16px/1.6 system-ui,-apple-system,
 .wrap{max-width:980px;margin:0 auto;padding:0 16px}
 nav{position:sticky;top:0;z-index:50;background:rgba(13,18,32,.92);backdrop-filter:blur(8px);
 border-bottom:1px solid var(--lin)}
-nav .wrap{display:flex;gap:4px;overflow-x:auto;padding:10px 16px;-webkit-overflow-scrolling:touch}
+nav .wrap{display:flex;gap:4px;overflow-x:auto;padding:10px 16px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+nav .wrap::-webkit-scrollbar{display:none}
 nav a{color:var(--tx2);text-decoration:none;font-size:.85rem;font-weight:600;padding:5px 12px;
 border-radius:999px;white-space:nowrap}
 nav a:hover,nav a:focus{color:var(--tx);background:var(--panel2)}
@@ -145,12 +165,12 @@ header h1{font-size:1.65rem;font-weight:700}
 header p{color:var(--tx2);font-size:.95rem;max-width:640px;margin:8px auto 0}
 .badge{display:inline-block;background:var(--panel2);border:1px solid var(--lin);color:var(--tx2);
 border-radius:999px;padding:2px 12px;font-size:.8rem;margin-top:10px}
+.badge.ok{border-color:var(--v);color:var(--v)}
 h2{font-size:1.15rem;margin:34px 0 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 h2 small{color:var(--tx2);font-weight:400;font-size:.85rem}
 .fl{width:20px;height:15px;border-radius:2px;vertical-align:-2px;object-fit:cover;background:var(--panel2)}
 .dias{display:flex;gap:6px;overflow-x:auto;padding:2px 2px 10px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
-.dias::-webkit-scrollbar,nav .wrap::-webkit-scrollbar{display:none}
-nav .wrap{scrollbar-width:none}
+.dias::-webkit-scrollbar{display:none}
 .dias button{flex:0 0 auto;background:var(--panel);border:1px solid var(--lin);color:var(--tx2);
 border-radius:999px;padding:5px 13px;font-size:.83rem;font-weight:600;cursor:pointer}
 .dias button.sel{background:var(--ac);border-color:var(--ac);color:#0d1220}
@@ -158,11 +178,15 @@ border-radius:999px;padding:5px 13px;font-size:.83rem;font-weight:600;cursor:poi
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}
 .card{background:var(--panel);border:1px solid var(--lin);border-radius:14px;padding:16px}
 .card.hoy{border-color:var(--ac)}
-.enc{display:flex;justify-content:space-between;align-items:baseline;font-size:.8rem;color:var(--tx2);margin-bottom:8px}
+.enc{display:flex;justify-content:space-between;align-items:baseline;gap:6px;font-size:.8rem;color:var(--tx2);margin-bottom:8px;flex-wrap:wrap}
 .eqs{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:600;font-size:1rem}
 .eqs span{display:flex;align-items:center;gap:6px;min-width:0}
 .eqs span:last-child{justify-content:flex-end;text-align:right}
 .marc{background:var(--panel2);border:1px solid var(--lin);border-radius:10px;padding:2px 10px;font-size:1.05rem;white-space:nowrap}
+.real{display:flex;justify-content:center;gap:8px;align-items:center;margin-top:10px;font-size:.85rem;
+background:var(--panel2);border-radius:10px;padding:6px}
+.real b{font-size:1rem}
+.real .ok{color:var(--v)} .real .ko{color:var(--d)}
 .barra{display:flex;height:9px;border-radius:6px;overflow:hidden;margin:12px 0 4px;background:var(--panel2)}
 .barra i{display:block;height:100%}
 .leyenda{display:flex;justify-content:space-between;font-size:.78rem;color:var(--tx2)}
@@ -171,7 +195,7 @@ border-radius:999px;padding:5px 13px;font-size:.83rem;font-weight:600;cursor:poi
 .stat b{display:block;font-size:.86rem;color:var(--tx)}
 .stat span{color:var(--tx2)}
 .pasado{opacity:.55}
-.etiq{font-size:.72rem;border:1px solid var(--lin);border-radius:6px;padding:1px 6px;color:var(--tx2)}
+.etiq{font-size:.72rem;border:1px solid var(--lin);border-radius:6px;padding:1px 6px;color:var(--tx2);white-space:nowrap}
 .etiq.jugado{border-color:var(--e);color:var(--e)}
 table{width:100%;border-collapse:collapse;font-size:.85rem}
 th,td{padding:7px 8px;text-align:left;border-bottom:1px solid var(--lin)}
@@ -179,6 +203,8 @@ th{color:var(--tx2);font-weight:600;font-size:.78rem;text-transform:uppercase;le
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 td .fl{margin-right:5px}
 .vd{color:var(--v)}.em{color:var(--e)}.dr{color:var(--d)}
+.realmini{display:block;font-size:.75rem;color:var(--tx2)}
+.realmini .ok{color:var(--v)} .realmini .ko{color:var(--d)}
 details{background:var(--panel);border:1px solid var(--lin);border-radius:12px;margin-bottom:10px;overflow:hidden}
 summary{cursor:pointer;padding:12px 16px;font-weight:600;list-style:none;display:flex;align-items:center;gap:8px}
 summary::after{content:"+";color:var(--tx2);margin-left:auto}
@@ -211,7 +237,8 @@ footer a{color:var(--ac);text-decoration:none}
   <h1>⚽ Mundial 2026 — predicciones del modelo</h1>
   <p>Probabilidades de victoria, córners, tarjetas y marcador más probable para cada partido,
   generadas con dos modelos XGBoost (goles y resultado 1X2 calibrado) y 10.000 mundiales simulados por Monte Carlo.</p>
-  <span class="badge">Datos regenerados: __FECHA_GEN__ · la jornada inicial se elige con tu fecha local</span>
+  <span class="badge">Datos regenerados: __FECHA_GEN__ · fechas y horas en tu zona horaria</span>
+  <span class="badge ok" id="aciertos"></span>
 </header>
 
 <main class="wrap">
@@ -233,8 +260,9 @@ footer a{color:var(--ac);text-decoration:none}
 
   <div class="aviso"><b>⚠️ Esto son probabilidades, no certezas.</b> El modelo acierta ~65% de los ganadores en datos
   de prueba; un favorito del 80% pierde 1 de cada 5 veces. Las estimaciones de córners y tarjetas son aproximaciones
-  Poisson sobre las medias de cada selección. Nada de esta página es consejo de apuestas: si juegas, que sea solo
-  entretenimiento, con límites y con dinero que no te duela perder.</div>
+  Poisson sobre las medias de cada selección. Los resultados reales provienen del calendario oficial y se refrescan
+  con la actualización diaria. Nada de esta página es consejo de apuestas: si juegas, que sea solo entretenimiento,
+  con límites y con dinero que no te duela perder.</div>
 
   <footer>Generado automáticamente con el modelo de
   <a href="https://github.com/jytsss/Simulaciones_Mundial">Simulaciones_Mundial</a> · @jyts__</footer>
@@ -248,8 +276,24 @@ const TABLAS = __TABLAS_JSON__;
 const ISO = __ISO_JSON__;
 
 const isoLocal = d => d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-const HOY = isoLocal(new Date());
-const FECHAS = [...new Set(PARTIDOS.map(p=>p.fecha))].sort();
+const AHORA = new Date();
+const HOY = isoLocal(AHORA);
+
+PARTIDOS.forEach(p => {
+  if (p.utc){
+    const ko = new Date(p.utc);
+    p._ko = ko;
+    p._dia = isoLocal(ko);
+    p._hora = String(ko.getHours()).padStart(2,'0')+':'+String(ko.getMinutes()).padStart(2,'0');
+  } else { p._ko = null; p._dia = p.fecha; p._hora = ''; }
+  p._fin = p.rgl !== null && p.rgl !== undefined;
+  if (p._fin){
+    const real = p.rgl > p.rgv ? '1' : (p.rgl < p.rgv ? '2' : 'X');
+    const pred = p.p1 >= p.px && p.p1 >= p.p2 ? '1' : (p.px >= p.p2 ? 'X' : '2');
+    p._acierto = real === pred;
+  }
+});
+const FECHAS = [...new Set(PARTIDOS.map(p=>p._dia))].sort();
 const FIN_GRUPOS = FECHAS[FECHAS.length-1];
 
 const fl = eq => ISO[eq] ? `<img class="fl" loading="lazy" alt="" src="https://flagcdn.com/w20/${ISO[eq]}.png" srcset="https://flagcdn.com/w40/${ISO[eq]}.png 2x">` : '';
@@ -259,19 +303,31 @@ function fmtFecha(f){
   return (+d)+' '+meses[+m-1];
 }
 
+const jugados = PARTIDOS.filter(p=>p._fin);
+if (jugados.length){
+  const ok = jugados.filter(p=>p._acierto).length;
+  document.getElementById('aciertos').textContent = `🎯 Modelo: ${ok}/${jugados.length} ganadores acertados`;
+} else {
+  document.getElementById('aciertos').style.display = 'none';
+}
+
 function tarjetaPartido(p){
   const div = document.createElement('div');
-  div.className = 'card' + (p.fecha === HOY ? ' hoy' : '');
-  const jugado = p.fecha < HOY ? '<span class="etiq jugado">ya jugado</span>' : `<span class="etiq">xG ${p.xgl} – ${p.xgv}</span>`;
+  div.className = 'card' + (p._dia === HOY ? ' hoy' : '');
+  const estado = p._fin ? '<span class="etiq jugado">finalizado</span>'
+    : (p._ko && p._ko < AHORA ? '<span class="etiq jugado">ya jugado</span>' : `<span class="etiq">xG ${p.xgl} – ${p.xgv}</span>`);
+  const real = p._fin ? `<div class="real"><span>Real:</span><b>${p.rgl}-${p.rgv}</b>
+    <span class="${p._acierto ? 'ok' : 'ko'}">${p._acierto ? '✓ ganador acertado' : '✗ fallo del modelo'}</span></div>` : '';
   div.innerHTML = `
-    <div class="enc"><span>Grupo ${p.grupo} · ${fmtFecha(p.fecha)}</span>${jugado}</div>
-    <div class="eqs"><span>${fl(p.local)}${p.local}</span><span class="marc">${p.marcador}</span><span>${p.visitante}${fl(p.visitante)}</span></div>
+    <div class="enc"><span>Grupo ${p.grupo} · ${fmtFecha(p._dia)}${p._hora ? ' · '+p._hora : ''}${p.ciudad ? ' · '+p.ciudad : ''}</span>${estado}</div>
+    <div class="eqs"><span>${fl(p.local)}${p.local}</span><span class="marc" title="Marcador más probable según el modelo">${p.marcador}</span><span>${p.visitante}${fl(p.visitante)}</span></div>
     <div class="barra">
       <i style="width:${p.p1}%;background:var(--v)"></i>
       <i style="width:${p.px}%;background:var(--e)"></i>
       <i style="width:${p.p2}%;background:var(--d)"></i>
     </div>
     <div class="leyenda"><span class="vd">1 · ${p.p1}%</span><span class="em">X · ${p.px}%</span><span class="dr">2 · ${p.p2}%</span></div>
+    ${real}
     <div class="stats">
       <div class="stat"><b>⛳ Córners: ${p.cor} esperados</b>
         <span>+7.5: ${p.c75}% · +8.5: ${p.c85}% · +9.5: ${p.c95}%</span></div>
@@ -286,7 +342,7 @@ let fechaSel = FECHAS.includes(HOY) ? HOY : (FECHAS.find(f => f > HOY) || FIN_GR
 function pintarDia(){
   const cont = document.getElementById('dia');
   cont.innerHTML = '';
-  const lista = PARTIDOS.filter(p => p.fecha === fechaSel);
+  const lista = PARTIDOS.filter(p => p._dia === fechaSel).sort((a,b) => (a._ko||0) - (b._ko||0));
   document.getElementById('sub-dia').textContent =
     fechaSel === HOY ? 'hoy · ' + fmtFecha(fechaSel) : fmtFecha(fechaSel);
   if (!lista.length){
@@ -338,20 +394,25 @@ document.getElementById('btn-mc').onclick = function(){
 const contG = document.getElementById('grupos');
 [...new Set(PARTIDOS.map(p=>p.grupo))].sort().forEach(g => {
   const det = document.createElement('details');
-  const filas = PARTIDOS.filter(p=>p.grupo===g).map(p => `
-    <tr class="${p.fecha < HOY ? 'pasado' : ''}">
-      <td>${fmtFecha(p.fecha)}</td><td>${fl(p.local)}${p.local} – ${fl(p.visitante)}${p.visitante}</td><td class="num"><b>${p.marcador}</b></td>
+  const filas = PARTIDOS.filter(p=>p.grupo===g).map(p => {
+    const real = p._fin ? `<span class="realmini">real ${p.rgl}-${p.rgv} <span class="${p._acierto?'ok':'ko'}">${p._acierto?'✓':'✗'}</span></span>` : '';
+    return `
+    <tr class="${p._fin || (p._ko && p._ko < AHORA) ? 'pasado' : ''}">
+      <td>${fmtFecha(p._dia)}${p._hora ? '<span class="realmini">'+p._hora+'</span>' : ''}</td>
+      <td>${fl(p.local)}${p.local} – ${fl(p.visitante)}${p.visitante}</td>
+      <td class="num"><b>${p.marcador}</b>${real}</td>
       <td class="num vd">${p.p1}%</td><td class="num em">${p.px}%</td><td class="num dr">${p.p2}%</td>
       <td class="num">${p.cor} <span style="color:var(--tx2)">(+7.5: ${p.c75}%)</span></td>
       <td class="num">${p.tar} <span style="color:var(--tx2)">(+3.5: ${p.t35}%)</span></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   const tabla = (TABLAS[g]||[]).map(t => {
     const marca = t.pos <= 2 ? ' ✅' : (t.pos === 3 ? ' 🟡' : '');
     return `<tr><td>${t.pos}</td><td>${fl(t.equipo)}${t.equipo}${marca}</td>
     <td class="num">${t.pts}</td><td class="num">${t.dg > 0 ? '+' : ''}${t.dg.toFixed(2)}</td></tr>`;
   }).join('');
   det.innerHTML = `<summary>Grupo ${g}</summary><div class="inner">
-    <div class="subtit">Partidos</div>
+    <div class="subtit">Partidos <span style="text-transform:none;font-weight:400">(hora local tuya)</span></div>
     <table><thead><tr><th>Fecha</th><th>Partido</th><th class="num">Pred.</th><th class="num">1</th>
     <th class="num">X</th><th class="num">2</th><th class="num">Córners</th><th class="num">Tarjetas</th></tr></thead>
     <tbody>${filas}</tbody></table>
@@ -391,5 +452,6 @@ if __name__ == '__main__':
     os.makedirs('docs', exist_ok=True)
     with open('docs/index.html', 'w', encoding='utf-8') as f:
         f.write(html)
-    print(f'Web generada en docs/index.html ({len(partidos)} partidos, {len(cuadro)} cruces, '
-          f'{len(campeon)} equipos en la tabla MC, {len(tablas)} grupos).')
+    jugados = sum(1 for p in partidos if p['rgl'] is not None)
+    print(f'Web generada en docs/index.html ({len(partidos)} partidos, {jugados} con resultado real, '
+          f'{len(cuadro)} cruces, {len(campeon)} equipos MC, {len(tablas)} grupos).')
